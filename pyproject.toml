@@ -1,0 +1,24 @@
+[project]
+name = "gpu-learning"
+version = "0.1.0"
+description = "Learning GPU programming with PyTorch on RHEL 9"
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }
+torchvision = { index = "pytorch-cuda" }
+torchaudio = { index = "pytorch-cuda" }
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cuda"
+explicit = true
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
