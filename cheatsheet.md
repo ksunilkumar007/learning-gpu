@@ -227,20 +227,3 @@ CPU time          → grows linearly (sequential)
 | 17 | `04_gpu_vs_cpu_benchmark.py` | 86x speedup at batch=512 |
 
 ---
-
-## Environment
-
-```bash
-# Setup
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-uv venv && source .venv/bin/activate
-uv pip install torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu124
-
-# Run scripts
-uv run src/foundation/01_verify_gpu.py
-
-# Check GPU
-nvidia-smi
-```
