@@ -1437,3 +1437,1206 @@ With ReduceLROnPlateau:
 > | `StepLR` | Reduce at fixed intervals — simple and predictable |
 > | `ReduceLROnPlateau` | Reduce when loss stops improving — most practical |
 > | `CosineAnnealingLR` | Smooth decay — popular in modern research |
+
+
+# Step 15 — Transfer Learning
+
+> **NOTE:** Transfer learning reuses a pretrained model's knowledge for a
+> new task. Freeze early layers, replace the last layer, retrain only that.
+>
+> ```
+> 1. Train model on large dataset  → learns general features
+> 2. Freeze early layers           → requires_grad = False
+> 3. Replace last layer            → nn.Linear(64, new_classes)
+> 4. Retrain only last layer       → fast, needs little data
+> ```
+
+### src/advanced/01_transfer_learning.py
+
+```python
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+device = torch.device("cuda")
+
+class CNN(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 8, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool2d(2)
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(16 * 7 * 7, 64)
+        self.fc2 = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = self.pool(self.relu(self.conv1(x)))
+        x = self.pool(self.relu(self.conv2(x)))
+        x = self.flatten(x)
+        x = self.relu(self.fc1(x))
+        return self.fc2(x)
+
+# Load pretrained CNN
+model = CNN().to(device)
+model.load_state_dict(torch.load("models/mnist_cnn.pth"))
+
+# Freeze all layers except last
+for name, param in model.named_parameters():
+    if "fc2" not in name:
+        param.requires_grad = False
+
+# Replace last layer for new task (5 classes instead of 10)
+model.fc2 = nn.Linear(64, 5).to(device)
+
+# Train only on digits 0-4
+def filter_classes(dataset, classes):
+    idx = [i for i, (_, label) in enumerate(dataset) if label in classes]
+    return torch.utils.data.Subset(dataset, idx)
+
+transform = transforms.ToTensor()
+train_data = datasets.MNIST(root="data", train=True, download=True, transform=transform)
+train_subset = filter_classes(train_data, classes=[0, 1, 2, 3, 4])
+train_loader = DataLoader(train_subset, batch_size=32, shuffle=True)
+
+# Only optimize the new last layer
+optimizer = torch.optim.Adam(model.fc2.parameters(), lr=0.001)
+loss_fn = nn.CrossEntropyLoss()
+
+for epoch in range(3):
+    model.train()
+    total_loss = 0
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        pred = model(images)
+        loss = loss_fn(pred, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"  Epoch {epoch+1}/3 | Loss: {total_loss/len(train_loader):.4f}")
+
+# Test accuracy
+test_data = datasets.MNIST(root="data", train=False, transform=transform)
+test_subset = filter_classes(test_data, classes=[0, 1, 2, 3, 4])
+test_loader = DataLoader(test_subset, batch_size=32, shuffle=False)
+
+model.eval()
+correct = total = 0
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        predicted = model(images).argmax(dim=1)
+        correct += (predicted == labels).sum().item()
+        total += labels.size(0)
+
+print(f"\nTest Accuracy (digits 0-4): {correct/total:.2%}")
+print(f"Correct: {correct} / {total}")
+```
+
+```
+Transfer learning — retraining last layer only:
+  Epoch 1/3 | Loss: 0.1079
+  Epoch 2/3 | Loss: 0.0179
+  Epoch 3/3 | Loss: 0.0132
+
+Test Accuracy (digits 0-4): 99.77%
+Correct: 5127 / 5139
+```
+
+> **Key insight:**
+>
+> ```
+> Full training   → 52,138 parameters → 98.79% accuracy
+> Transfer learn  →    650 parameters → 99.77% accuracy
+> ```
+>
+> Better accuracy, fewer parameters, faster training.
+
+---
+
+## Step 16 — Model Optimization
+
+> **NOTE:** A trained model can be made faster and smaller without losing
+> accuracy using two main techniques:
+>
+> ```
+> TorchScript  → compile model = faster inference
+> Quantization → float32 → int8 = smaller model
+> ```
+
+### src/advanced/02_model_optimization.py
+
+```python
+import torch
+import torch.nn as nn
+import time
+import os
+
+device = torch.device("cuda")
+
+class CNN(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 8, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool2d(2)
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(16 * 7 * 7, 64)
+        self.fc2 = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = self.pool(self.relu(self.conv1(x)))
+        x = self.pool(self.relu(self.conv2(x)))
+        x = self.flatten(x)
+        x = self.relu(self.fc1(x))
+        return self.fc2(x)
+
+# Load pretrained model
+model = CNN().to(device)
+model.load_state_dict(torch.load("models/mnist_cnn.pth"))
+model.eval()
+
+dummy_input = torch.randn(1, 1, 28, 28).to(device)
+
+# Warmup
+for _ in range(10):
+    _ = model(dummy_input)
+
+# Baseline benchmark
+torch.cuda.synchronize()
+start = time.time()
+for _ in range(1000):
+    _ = model(dummy_input)
+torch.cuda.synchronize()
+baseline_ms = (time.time() - start) / 1000 * 1000
+print(f"Baseline inference: {baseline_ms:.4f} ms per image")
+
+# TorchScript — compile model into optimized representation
+scripted_model = torch.jit.script(model)
+
+for _ in range(10):
+    _ = scripted_model(dummy_input)
+
+torch.cuda.synchronize()
+start = time.time()
+for _ in range(1000):
+    _ = scripted_model(dummy_input)
+torch.cuda.synchronize()
+scripted_ms = (time.time() - start) / 1000 * 1000
+print(f"TorchScript inference: {scripted_ms:.4f} ms per image")
+print(f"Speedup: {baseline_ms / scripted_ms:.2f}x")
+
+torch.jit.save(scripted_model, "models/mnist_cnn_scripted.pt")
+
+# Quantization — convert float32 weights to int8 (CPU only)
+model_cpu = CNN()
+model_cpu.load_state_dict(torch.load("models/mnist_cnn.pth"))
+model_cpu.eval()
+
+quantized_model = torch.quantization.quantize_dynamic(
+    model_cpu,
+    {nn.Linear},       # quantize Linear layers
+    dtype=torch.qint8  # use 8-bit integers
+)
+
+torch.save(model_cpu.state_dict(), "models/mnist_cnn_fp32.pth")
+torch.save(quantized_model.state_dict(), "models/mnist_cnn_int8.pth")
+
+fp32_size = os.path.getsize("models/mnist_cnn_fp32.pth") / 1024
+int8_size = os.path.getsize("models/mnist_cnn_int8.pth") / 1024
+print(f"\nModel size comparison:")
+print(f"  float32: {fp32_size:.1f} KB")
+print(f"  int8:    {int8_size:.1f} KB")
+print(f"  Reduction: {(1 - int8_size/fp32_size):.1%} smaller")
+
+dummy_cpu = torch.randn(1, 1, 28, 28)
+start = time.time()
+for _ in range(1000):
+    _ = quantized_model(dummy_cpu)
+quantized_ms = (time.time() - start) / 1000 * 1000
+print(f"\nQuantized CPU inference: {quantized_ms:.4f} ms per image")
+```
+
+```
+Baseline inference:    0.2904 ms per image
+TorchScript inference: 0.2079 ms per image  → 1.40x faster
+Scripted model saved to models/mnist_cnn_scripted.pt
+
+Model size comparison:
+  float32: 206.8 KB
+  int8:     59.3 KB
+  Reduction: 71.3% smaller
+
+Quantized CPU inference: 0.3166 ms per image
+```
+
+> **Key insight:**
+>
+> | Technique | Benefit | Use case |
+> |-----------|---------|----------|
+> | `TorchScript` | 1.4x faster | Production GPU serving |
+> | `Quantization` | 71% smaller | Edge/mobile deployment |
+> | Both together | Maximum optimization | Production deployment |
+
+---
+
+
+# Step 17 — Training & Inference Pipeline
+
+> **NOTE:** In production, training and inference are always separate concerns.
+> Wrapping them in classes makes them reusable and importable.
+>
+> ```
+> MNISTTrainingPipeline  → train() → save()
+>                                       ↓
+> MNISTInferencePipeline → load() → predict() → predict_batch()
+> ```
+
+### src/advanced/03_inference_pipeline.py
+
+```python
+import torch
+import torch.nn as nn
+from torchvision import transforms, datasets
+from PIL import Image
+import time
+
+device = torch.device("cuda")
+
+# ── Architecture ──────────────────────────────────────────────────────────────
+class CNN(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 8, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool2d(2)
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(16 * 7 * 7, 64)
+        self.fc2 = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = self.pool(self.relu(self.conv1(x)))
+        x = self.pool(self.relu(self.conv2(x)))
+        x = self.flatten(x)
+        x = self.relu(self.fc1(x))
+        return self.fc2(x)
+
+# ── Training Pipeline ─────────────────────────────────────────────────────────
+class MNISTTrainingPipeline:
+    def __init__(self, num_classes=10, lr=0.001):
+        self.model = CNN(num_classes=num_classes).to(device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.loss_fn = nn.CrossEntropyLoss()
+        self.transform = transforms.Compose([transforms.ToTensor()])
+        print(f"Training pipeline ready | device: {device}")
+
+    def train(self, epochs=5):
+        train_data = datasets.MNIST(root="data", train=True, download=True, transform=self.transform)
+        train_loader = torch.utils.data.DataLoader(train_data, batch_size=32, shuffle=True)
+        for epoch in range(epochs):
+            self.model.train()
+            total_loss = 0
+            for images, labels in train_loader:
+                images, labels = images.to(device), labels.to(device)
+                pred = self.model(images)
+                loss = self.loss_fn(pred, labels)
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+            print(f"  Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(train_loader):.4f}")
+
+    def save(self, path):
+        torch.save(self.model.state_dict(), path)
+        print(f"Model saved to {path}")
+
+# ── Inference Pipeline ────────────────────────────────────────────────────────
+class MNISTInferencePipeline:
+    def __init__(self, model_path):
+        self.model = CNN().to(device)
+        self.model.load_state_dict(torch.load(model_path))
+        self.model.eval()
+        self.transform = transforms.Compose([
+            transforms.Grayscale(),
+            transforms.Resize((28, 28)),
+            transforms.ToTensor(),
+        ])
+        print(f"Inference pipeline ready | device: {device}")
+
+    def predict(self, image):
+        tensor = self.transform(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            output = self.model(tensor)
+            probabilities = torch.softmax(output, dim=1)
+            confidence, predicted = probabilities.max(dim=1)
+        return {
+            "digit": predicted.item(),
+            "confidence": confidence.item(),
+            "all_probs": probabilities.squeeze().tolist()
+        }
+
+    def predict_batch(self, images):
+        tensors = torch.stack([self.transform(img) for img in images]).to(device)
+        with torch.no_grad():
+            outputs = self.model(tensors)
+            probs = torch.softmax(outputs, dim=1)
+            confidences, predicted = probs.max(dim=1)
+        return [
+            {"digit": d.item(), "confidence": c.item()}
+            for d, c in zip(predicted, confidences)
+        ]
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=== Training Pipeline ===")
+    trainer = MNISTTrainingPipeline(lr=0.001)
+    trainer.train(epochs=3)
+    trainer.save("models/mnist_cnn.pth")
+
+    print("\n=== Inference Pipeline ===")
+    pipeline = MNISTInferencePipeline("models/mnist_cnn.pth")
+    test_data = datasets.MNIST(root="data", train=False, download=True)
+
+    print("\nSingle image predictions:")
+    for i in range(5):
+        image, true_label = test_data[i]
+        result = pipeline.predict(image)
+        status = "✓" if result["digit"] == true_label else "✗"
+        print(f"  {status} True: {true_label} | Predicted: {result['digit']} | Confidence: {result['confidence']:.2%}")
+
+    print("\nBatch prediction (10 images at once):")
+    images = [test_data[i][0] for i in range(10)]
+    labels = [test_data[i][1] for i in range(10)]
+    start = time.time()
+    results = pipeline.predict_batch(images)
+    elapsed = (time.time() - start) * 1000
+    correct = sum(r["digit"] == l for r, l in zip(results, labels))
+    print(f"  Accuracy: {correct}/10")
+    print(f"  Batch time: {elapsed:.2f} ms")
+    print(f"  Per image: {elapsed/10:.2f} ms")
+```
+
+```
+=== Training Pipeline ===
+Training pipeline ready | device: cuda
+  Epoch 1/3 | Loss: 0.2564
+  Epoch 2/3 | Loss: 0.0774
+  Epoch 3/3 | Loss: 0.0521
+Model saved to models/mnist_cnn.pth
+
+=== Inference Pipeline ===
+Inference pipeline ready | device: cuda
+
+Single image predictions:
+  ✓ True: 7 | Predicted: 7 | Confidence: 99.99%
+  ✓ True: 2 | Predicted: 2 | Confidence: 100.00%
+  ✓ True: 1 | Predicted: 1 | Confidence: 99.84%
+  ✓ True: 0 | Predicted: 0 | Confidence: 99.91%
+  ✓ True: 4 | Predicted: 4 | Confidence: 99.97%
+
+Batch prediction (10 images at once):
+  Accuracy: 10/10
+  Batch time: 5.47 ms
+  Per image: 0.55 ms
+```
+
+> **Key insight:** `if __name__ == "__main__"` means these classes can be
+> imported by other scripts without running training automatically.
+> That is the proper Python module pattern.
+
+---
+
+
+
+## Step 19 — Embeddings
+
+> **NOTE:** Text can't be fed into a neural network as strings.
+> Embeddings convert words into float vectors that capture meaning.
+>
+> ```
+> word → integer (vocabulary lookup)
+> integer → float vector (embedding layer)
+>
+> "cat" → 3 → [0.2, 0.8, 0.1, 0.4]
+> "dog" → 4 → [0.3, 0.7, 0.2, 0.3]  ← similar to cat
+> "car" → 5 → [0.9, 0.1, 0.8, 0.2]  ← very different
+> ```
+
+### src/llm/01_embeddings.py
+
+```python
+import torch
+import torch.nn as nn
+
+device = torch.device("cuda")
+
+# Vocabulary — maps words to integers
+vocab = {
+    "": 0, "": 1, "the": 2, "cat": 3,
+    "dog": 4, "sat": 5, "on": 6, "mat": 7, "ran": 8, "fast": 9,
+}
+
+vocab_size = len(vocab)   # 10 words
+embed_dim  = 4            # each word becomes a 4-number vector
+
+# Embedding layer — lookup table of shape [vocab_size, embed_dim]
+embedding = nn.Embedding(vocab_size, embed_dim).to(device)
+
+# Convert sentence to vectors
+sentence = ["the", "cat", "sat", "on", "the", "mat"]
+indices  = torch.tensor([vocab[w] for w in sentence]).to(device)
+vectors  = embedding(indices)
+
+# Similarity model — train embeddings to understand relationships
+class SimilarityModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.fc        = nn.Linear(embed_dim * 2, 1)
+        self.sigmoid   = nn.Sigmoid()
+
+    def forward(self, w1, w2):
+        e1 = self.embedding(w1)
+        e2 = self.embedding(w2)
+        x  = torch.cat([e1, e2], dim=-1)
+        return self.sigmoid(self.fc(x)).squeeze()
+
+# Training pairs — (word1, word2, related?)
+pairs = [
+    ("cat", "dog",  1),   # related — both animals
+    ("cat", "mat",  0),   # not related
+    ("dog", "fast", 0),   # not related
+    ("sat", "ran",  1),   # related — both verbs
+    ("the", "on",   1),   # related — both function words
+    ("cat", "ran",  0),   # not related
+]
+
+model     = SimilarityModel().to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+loss_fn   = nn.BCELoss()
+
+w1s = torch.tensor([vocab[p[0]] for p in pairs]).to(device)
+w2s = torch.tensor([vocab[p[1]] for p in pairs]).to(device)
+ys  = torch.tensor([p[2] for p in pairs], dtype=torch.float).to(device)
+
+for epoch in range(500):
+    pred = model(w1s, w2s)
+    loss = loss_fn(pred, ys)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    if epoch % 100 == 0:
+        print(f"Epoch {epoch} | Loss: {loss.item():.4f}")
+```
+
+```
+Epoch 0   | Loss: 0.7554
+Epoch 100 | Loss: 0.0431
+Epoch 200 | Loss: 0.0094
+Epoch 300 | Loss: 0.0041
+Epoch 400 | Loss: 0.0023
+
+Similarity predictions:
+  cat  + dog  → similarity: 0.9971  ← animals
+  sat  + ran  → similarity: 0.9973  ← verbs
+  cat  + mat  → similarity: 0.0004  ← unrelated
+  dog  + fast → similarity: 0.0001  ← unrelated
+```
+
+> **Key insight:** The network was never told cat and dog are animals.
+> It figured out relationships purely by adjusting 4 float numbers per word
+> until similar words had similar vectors. This is exactly how GPT and LLaMA
+> represent language internally — just at a much larger scale.
+>
+> ```
+> Your model: 10 words,      4 dimensions
+> GPT-4:      100,000 words, 12,288 dimensions
+
+## Step 20 — Attention Mechanism
+
+> **NOTE:** Embeddings give every word a fixed vector. Attention lets each
+> word look at all other words and decide which ones are relevant.
+>
+> ```
+> "bank" near "river" → attends to "river" → means riverbank
+> "bank" near "loan"  → attends to "loan"  → means financial bank
+>
+> Attention(Q, K, V) = softmax(QK^T / √d) × V
+>
+> Q (Query) → what am I looking for?
+> K (Key)   → what do I contain?
+> V (Value) → what do I pass forward?
+> ```
+
+### src/llm/02_attention.py
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+device = torch.device("cuda")
+
+class SelfAttention(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.W_Q  = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_K  = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_V  = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.scale = embed_dim ** 0.5
+
+    def forward(self, x):
+        Q = self.W_Q(x)
+        K = self.W_K(x)
+        V = self.W_V(x)
+
+        # Step 1: similarity scores between every pair of words
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+
+        # Step 2: convert to probabilities
+        weights = F.softmax(scores, dim=-1)
+
+        # Step 3: weighted mix of value vectors
+        output = torch.matmul(weights, V)
+        return output, weights
+
+attention = SelfAttention(embed_dim=8).to(device)
+
+# [batch, seq_len, embed_dim]
+x_batch = torch.randn(1, 4, 8).to(device)
+output, weights = attention(x_batch)
+```
+
+```
+Input shape:  torch.Size([1, 4, 8])
+Output shape: torch.Size([1, 4, 8])
+Weights shape: torch.Size([1, 4, 4])
+
+Attention weights per word:
+  word0 attends: ['0.30', '0.47', '0.05', '0.18']
+  word1 attends: ['0.23', '0.26', '0.31', '0.20']
+  word2 attends: ['0.18', '0.18', '0.38', '0.26']
+  word3 attends: ['0.41', '0.25', '0.17', '0.18']
+```
+
+> **Key insight:** Input and output are the same shape `[1, 4, 8]`.
+> Attention does not change the shape — it enriches each word's vector
+> with context from the whole sentence. This single formula is the core
+> of every transformer — GPT, BERT, LLaMA all use exactly this.
+
+
+#[cloud-user@bastion gpu-learning]$ uv run src/llm/03_transformer_block.py 
+Input shape:  torch.Size([1, 4, 8])
+Output shape: torch.Size([1, 4, 8])
+
+Transformer block parameters:
+  attention.W_Q.weight           | torch.Size([8, 8])
+  attention.W_K.weight           | torch.Size([8, 8])
+  attention.W_V.weight           | torch.Size([8, 8])
+  ff.0.weight                    | torch.Size([32, 8])
+  ff.0.bias                      | torch.Size([32])
+  ff.2.weight                    | torch.Size([8, 32])
+  ff.2.bias                      | torch.Size([8])
+  norm1.weight                   | torch.Size([8])
+  norm1.bias                     | torch.Size([8])
+  norm2.weight                   | torch.Size([8])
+  norm2.bias                     | torch.Size([8])
+   1 blocks →    776 parameters
+   2 blocks →   1552 parameters
+   4 blocks →   3104 parameters
+   8 blocks →   6208 parameters
+  12 blocks →   9312 parameters
+
+Real world:
+  GPT-2 small  → 12 blocks, embed=768  → 117M params
+  GPT-3        → 96 blocks, embed=12288 → 175B params
+  LLaMA 7B     → 32 blocks, embed=4096  →   7B params
+[cloud-user@bastion gpu-learning]$ 
+
+
+# Step 21 — Transformer Block
+
+> **NOTE:** A transformer block combines attention with feedforward layers
+> and residual connections. Stacking these blocks is literally what GPT is.
+>
+> ```
+> Input
+>   ↓
+> Self Attention      ← context-aware vectors
+>   ↓
+> Add & Norm          ← residual + layer normalization
+>   ↓
+> Feed Forward        ← two linear layers
+>   ↓
+> Add & Norm          ← residual + layer normalization
+>   ↓
+> Output (same shape as input)
+> ```
+
+### src/llm/03_transformer_block.py
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+device = torch.device("cuda")
+
+class SelfAttention(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.W_Q   = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_K   = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_V   = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.scale = embed_dim ** 0.5
+
+    def forward(self, x):
+        Q = self.W_Q(x)
+        K = self.W_K(x)
+        V = self.W_V(x)
+        scores  = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        weights = F.softmax(scores, dim=-1)
+        return torch.matmul(weights, V)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, ff_dim):
+        super().__init__()
+        self.attention = SelfAttention(embed_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, ff_dim),
+            nn.ReLU(),
+            nn.Linear(ff_dim, embed_dim),
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        x = self.norm1(x + self.attention(x))  # attention + residual + norm
+        x = self.norm2(x + self.ff(x))         # feedforward + residual + norm
+        return x
+
+class TransformerStack(nn.Module):
+    def __init__(self, embed_dim, ff_dim, num_blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, ff_dim)
+            for _ in range(num_blocks)
+        ])
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
+```
+
+```
+Input shape:  torch.Size([1, 4, 8])
+Output shape: torch.Size([1, 4, 8])
+
+   1 blocks →    776 parameters
+   2 blocks →  1,552 parameters
+   4 blocks →  3,104 parameters
+   8 blocks →  6,208 parameters
+  12 blocks →  9,312 parameters
+
+Real world:
+  GPT-2 small  → 12 blocks, embed=768  → 117M params
+  GPT-3        → 96 blocks, embed=12288 → 175B params
+  LLaMA 7B     → 32 blocks, embed=4096  →   7B params
+```
+
+> **Key insight:** Same architecture — just wider and deeper.
+>
+> ```
+> Your model:  embed=8,    12 blocks →       9,312 params
+> GPT-2 small: embed=768,  12 blocks → 117,000,000 params
+> LLaMA 7B:    embed=4096, 32 blocks →   7,000,000,000 params
+> ```
+>
+> Residual connections (`x + attention(x)`) prevent the network from
+> forgetting the original input as it passes through many layers.
+
+---
+
+## Step 22 — Mini GPT
+
+> **NOTE:** A GPT generates text one token at a time by predicting the
+> next token from all previous tokens. The causal mask prevents it from
+> cheating by looking at future tokens.
+>
+> ```
+> Text → tokenize → embed → positional encode
+>      → transformer blocks → linear head
+>      → softmax → sample next token → repeat
+> ```
+
+### src/llm/04_mini_gpt.py
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+device = torch.device("cuda")
+torch.manual_seed(42)
+
+# Training text
+text = """the cat sat on the mat
+the dog ran fast
+the cat ran on the mat
+the dog sat fast
+the cat and dog sat on the mat
+the dog and cat ran fast"""
+
+# Character-level tokenizer
+chars     = sorted(set(text))
+vocab_size = len(chars)
+ch2idx    = {ch: i for i, ch in enumerate(chars)}
+idx2ch    = {i: ch for i, ch in enumerate(chars)}
+encode    = lambda s: [ch2idx[c] for c in s]
+decode    = lambda l: ''.join([idx2ch[i] for i in l])
+
+data = torch.tensor(encode(text), dtype=torch.long).to(device)
+
+class SelfAttention(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.W_Q   = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_K   = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_V   = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.scale = embed_dim ** 0.5
+
+    def forward(self, x):
+        Q = self.W_Q(x)
+        K = self.W_K(x)
+        V = self.W_V(x)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        T      = x.size(1)
+        mask   = torch.tril(torch.ones(T, T, device=x.device))
+        scores = scores.masked_fill(mask == 0, float('-inf'))  # causal mask
+        return torch.matmul(F.softmax(scores, dim=-1), V)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, ff_dim):
+        super().__init__()
+        self.attention = SelfAttention(embed_dim)
+        self.ff    = nn.Sequential(
+            nn.Linear(embed_dim, ff_dim), nn.ReLU(),
+            nn.Linear(ff_dim, embed_dim),
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        x = self.norm1(x + self.attention(x))
+        x = self.norm2(x + self.ff(x))
+        return x
+
+class MiniGPT(nn.Module):
+    def __init__(self, vocab_size, embed_dim, ff_dim, num_blocks, max_seq_len):
+        super().__init__()
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        self.pos_embedding   = nn.Embedding(max_seq_len, embed_dim)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, ff_dim) for _ in range(num_blocks)
+        ])
+        self.head = nn.Linear(embed_dim, vocab_size)
+
+    def forward(self, idx):
+        B, T     = idx.shape
+        tok_emb  = self.token_embedding(idx)
+        pos_emb  = self.pos_embedding(torch.arange(T, device=idx.device))
+        x        = tok_emb + pos_emb
+        for block in self.blocks:
+            x = block(x)
+        return self.head(x)
+
+model = MiniGPT(vocab_size, embed_dim=32, ff_dim=128,
+                num_blocks=2, max_seq_len=32).to(device)
+
+# Training
+block_size = 16
+batch_size = 8
+
+def get_batch():
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x  = torch.stack([data[i:i+block_size] for i in ix])
+    y  = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    return x, y
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+for epoch in range(1000):
+    x, y   = get_batch()
+    logits = model(x)
+    loss   = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+# Generation
+def generate(prompt, max_new_tokens=50):
+    model.eval()
+    idx = torch.tensor(encode(prompt), dtype=torch.long).unsqueeze(0).to(device)
+    for _ in range(max_new_tokens):
+        logits   = model(idx[:, -block_size:])
+        probs    = F.softmax(logits[:, -1, :], dim=-1)
+        next_tok = torch.multinomial(probs, 1)
+        idx      = torch.cat([idx, next_tok], dim=1)
+    return decode(idx[0].tolist())
+
+print(generate("the cat", max_new_tokens=60))
+print(generate("the dog", max_new_tokens=60))
+```
+
+```
+MiniGPT parameters: 25,103
+  Epoch    0 | Loss: 2.9415
+  Epoch  200 | Loss: 0.2790
+  Epoch  400 | Loss: 0.2060
+  Epoch  600 | Loss: 0.1580
+  Epoch  800 | Loss: 0.1920
+
+Generated text:
+the cat and dog sat ran fast
+the cat ran on the mat
+the dog and cat
+the dog sat on the mat
+the dog and cat ran on the mat
+```
+
+> **Key insight:** This is exactly what GPT-4 does — just with billions
+> more parameters and trillions of characters of training data.
+>
+> ```
+> MiniGPT:  25K params,  135 chars  → generates cat/dog sentences
+> GPT-4:    1.8T params, ~13T tokens → generates anything
+> ```
+>
+> The causal mask (`torch.tril`) is what makes it generative —
+> each token can only see past tokens, never future ones.
+
+# Step 23 — Loading a Pretrained LLM (GPT-2)
+
+> **NOTE:** HuggingFace Transformers lets you load pretrained models
+> in two lines. Same architecture as your MiniGPT — just much bigger.
+>
+> ```
+> Your MiniGPT → vocab=15,    embed=32,  blocks=2  →    25K params
+> GPT-2        → vocab=50257, embed=768, blocks=12 → 124M params
+> ```
+
+### Install
+
+```bash
+uv pip install transformers accelerate
+```
+
+### src/llm/06_pretrained_llm.py
+
+```python
+import torch
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+device = torch.device("cuda")
+
+# Load pretrained GPT-2
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token   # GPT-2 has no pad token
+model     = GPT2LMHeadModel.from_pretrained("gpt2").to(device)
+model.eval()
+
+params = sum(p.numel() for p in model.parameters())
+print(f"Parameters: {params:,}")
+print(f"Device:     {next(model.parameters()).device}")
+
+def generate(prompt, max_new_tokens=50, temperature=0.8):
+    inputs = tokenizer(
+        prompt, return_tensors="pt", padding=True
+    ).to(device)
+    with torch.no_grad():
+        outputs = model.generate(
+            inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+print(generate("The cat sat on the mat and"))
+print(generate("Once upon a time in a land far away"))
+print(generate("The best way to learn machine learning is"))
+```
+
+```
+Parameters: 124,439,808
+Device:     cuda:0
+
+The cat sat on the mat and stared at it for a long time, then
+his head snapped back up to look at his own.
+
+Once upon a time in a land far away, the only one who knew how
+to properly communicate was. He was no stranger to the black world...
+
+The best way to learn machine learning is to learn how to do it
+in a real way. I'm not going to say that you should learn machine
+learning because you don't need it...
+```
+
+> **Key insight:**
+>
+> ```
+> temperature=0.1 → very focused, repetitive, safe
+> temperature=0.8 → balanced
+> temperature=1.5 → creative, unpredictable
+> ```
+>
+> Training data and scale is everything — same architecture,
+> vastly different capability.
+
+## Step 24 — Fine-tuning with LoRA
+
+> **NOTE:** LoRA freezes the entire pretrained model and adds tiny
+> trainable adapter matrices. Only 0.24% of parameters are updated.
+>
+> ```
+> Full fine-tuning → update all 124M params → huge memory
+> LoRA             → freeze all, add adapters → 294K params
+>
+> Original weight W (frozen)
+> + Small matrices A × B (trainable, rank=8)
+> = Effective weight W + AB
+> ```
+
+### Install
+
+```bash
+uv pip install peft
+```
+
+### src/llm/07_finetune_lora.py
+
+```python
+import torch
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from peft import LoraConfig, get_peft_model
+
+device = torch.device("cuda")
+
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+model = GPT2LMHeadModel.from_pretrained("gpt2").to(device)
+
+# Apply LoRA
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=32,
+    target_modules=["c_attn"],
+    lora_dropout=0.1,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+model = get_peft_model(model, lora_config)
+
+# Training data
+training_data = [
+    "Question: What is a neural network? Answer: A neural network is a machine learning model inspired by the brain, made of layers of connected neurons that learn patterns from data.",
+    "Question: What is gradient descent? Answer: Gradient descent is an optimization algorithm that minimizes loss by updating weights in the direction that reduces the error.",
+    "Question: What is overfitting? Answer: Overfitting is when a model memorizes training data and fails to generalize to new unseen data.",
+    "Question: What is a GPU? Answer: A GPU is a graphics processing unit that accelerates machine learning by performing thousands of parallel computations simultaneously.",
+    "Question: What is backpropagation? Answer: Backpropagation is the algorithm that computes gradients by propagating the error backwards through the network layers.",
+]
+
+def tokenize(text):
+    tokens = tokenizer(
+        text, return_tensors="pt",
+        truncation=True, max_length=128, padding="max_length"
+    )
+    return tokens["input_ids"].to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+# Train
+model.train()
+for epoch in range(200):
+    total_loss = 0
+    for text in training_data:
+        input_ids = tokenize(text)
+        outputs   = model(input_ids, labels=input_ids)
+        loss      = outputs.loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    if epoch % 40 == 0:
+        print(f"  Epoch {epoch:3d} | Loss: {total_loss/len(training_data):.4f}")
+
+# Generate
+def answer(question, max_new_tokens=60):
+    model.eval()
+    prompt = f"Question: {question} Answer:"
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(device)
+    with torch.no_grad():
+        outputs = model.generate(
+            inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=max_new_tokens,
+            temperature=0.1,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+            repetition_penalty=1.3
+        )
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+print(answer("What is a neural network?"))
+print(answer("What is overfitting?"))
+print(answer("What is a GPU?"))
+```
+
+```
+Total parameters:     124,734,720
+Trainable parameters:     294,912  → 0.24%
+
+  Epoch   0 | Loss: 11.0423
+  Epoch  40 | Loss: 0.7652
+  Epoch  80 | Loss: 0.1327
+  Epoch 120 | Loss: 0.0840
+  Epoch 160 | Loss: 0.0511
+
+Question: What is a neural network? Answer: A brain model of the human
+body is inspired by an ancient Greek statue, made from layers of connected
+neurons that learn patterns through experience.
+
+Question: What is overfitting? Answer: Overfit refers to when a model
+memorizes training data and fails in the general direction.
+
+Question: What is a GPU? Answer: A GPUs are graphics processing units
+that accelerate machine learning by performing thousands of parallel
+computations simultaneously.
+```
+
+> **Key insight:** This is exactly how companies fine-tune LLaMA and
+> Mistral on custom data — same LoRA pattern, just bigger models.
+>
+> ```
+> r=8   → 294K trainable params  → fast, less accurate
+> r=64  → 2.4M trainable params  → slower, more accurate
+> ```
+
+
+## Step 25 — Serving with Ollama
+
+> **NOTE:** Ollama runs any LLM as a REST API server — same interface
+> as OpenAI but fully local on your GPU.
+>
+> ```
+> Without Ollama → python script.py → output → done
+> With Ollama    → always running → any client can call it
+>
+> GET  /api/tags      → list models
+> POST /api/generate  → single prompt
+> POST /api/chat      → conversation with history
+> ```
+
+### Setup
+
+```bash
+# Run Ollama in Podman with GPU access
+mkdir -p ~/.ollama
+podman run -d \
+  --name ollama \
+  --device nvidia.com/gpu=all \
+  -p 11434:11434 \
+  -v ~/.ollama:/root/.ollama:Z \
+  --security-opt label=disable \
+  docker.io/ollama/ollama
+
+# Pull a model
+podman exec ollama ollama pull tinyllama
+```
+
+### src/llm/08_serve_ollama.py
+
+```python
+import requests
+
+OLLAMA_URL = "http://localhost:11434"
+
+def list_models():
+    response = requests.get(f"{OLLAMA_URL}/api/tags")
+    models = response.json()["models"]
+    for m in models:
+        print(f"  {m['name']:30s} | {m['size']/1e9:.2f} GB")
+
+def generate(prompt, model="tinyllama", stream=False):
+    response = requests.post(
+        f"{OLLAMA_URL}/api/generate",
+        json={"model": model, "prompt": prompt, "stream": stream}
+    )
+    return response.json()["response"]
+
+def chat(messages, model="tinyllama"):
+    response = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json={"model": model, "messages": messages, "stream": False}
+    )
+    return response.json()["message"]["content"]
+
+if __name__ == "__main__":
+    # 1. List models
+    list_models()
+
+    # 2. Generate
+    print(generate("What is backpropagation? One sentence."))
+
+    # 3. Chat
+    messages = [{"role": "user", "content": "What is overfitting?"}]
+    print(chat(messages))
+
+    # 4. Multi-turn chat
+    history = []
+    for q in ["What is a neural network?", "How does it learn?", "What can go wrong?"]:
+        history.append({"role": "user", "content": q})
+        answer = chat(history)
+        history.append({"role": "assistant", "content": answer})
+        print(f"Q: {q}")
+        print(f"A: {answer[:200]}")
+        print()
+```
+
+```
+=== Models ===
+  tinyllama:latest               | 0.64 GB
+
+=== Generate ===
+Backpropagation is a process in which errors or adjustments are made
+to the weights of an artificial neural network...
+
+=== Multi-turn Chat ===
+Q: What is a neural network?
+A: A neural network is an algorithmic model inspired by biological
+   nervous systems...
+
+Q: How does it learn?
+A: Neural networks learn by processing data through multiple layers...
+
+Q: What can go wrong?
+A: There are several potential issues including overfitting, vanishing
+   gradients, and poor generalization...
+```
+
+> **Key insight:** Multi-turn chat passes the full conversation history
+> with every request. Ollama has no memory — you maintain the state.
+>
+> ```
+> tinyllama  → 0.64 GB  → fast, fits anywhere
+> llama3     → 4.7 GB   → smarter, needs more VRAM
+> llama3:70b → 40 GB    → very smart, needs your L4 + more
+> ```
